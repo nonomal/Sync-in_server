@@ -1,7 +1,7 @@
 import { HttpClient, HttpErrorResponse } from '@angular/common/http'
 import { Component, inject, input, model, OnDestroy, OnInit } from '@angular/core'
 import { FILE_MODE } from '@sync-in-server/backend/src/applications/files/constants/operations'
-import { ONLY_OFFICE_APP_LOCK } from '@sync-in-server/backend/src/applications/files/editors/only-office/only-office.constants'
+import { EURO_OFFICE_APP_LOCK, ONLY_OFFICE_APP_LOCK } from '@sync-in-server/backend/src/applications/files/editors/only-office/only-office.constants'
 import type { OnlyOfficeReqDto } from '@sync-in-server/backend/src/applications/files/editors/only-office/only-office.dtos'
 import { API_ONLY_OFFICE_SETTINGS } from '@sync-in-server/backend/src/applications/files/editors/only-office/only-office.routes'
 import { LayoutService } from '../../../../layout/layout.service'
@@ -26,6 +26,7 @@ import { OnlyOfficeComponent } from '../utils/only-office.component'
       <div [style.height.px]="currentHeight()">
         <app-files-onlyoffice-document
           [id]="docId"
+          [editorName]="officeEditorName"
           [documentServerUrl]="documentConfig.documentServerUrl"
           [config]="documentConfig.config"
           (loadError)="loadError($event)"
@@ -44,6 +45,7 @@ export class FilesViewerOnlyOfficeComponent implements OnInit, OnDestroy {
   private readonly http = inject(HttpClient)
   private readonly layout = inject(LayoutService)
   private readonly store = inject(StoreService)
+  protected readonly officeEditorName = this.store.server().files.editors.onlyoffice ? ONLY_OFFICE_APP_LOCK : EURO_OFFICE_APP_LOCK
 
   ngOnInit() {
     this.docId = `viewer-doc-${this.file().id}`
@@ -71,7 +73,7 @@ export class FilesViewerOnlyOfficeComponent implements OnInit, OnDestroy {
               fullName: this.store.user.getValue().fullName,
               email: this.store.user.getValue().email
             },
-            app: ONLY_OFFICE_APP_LOCK,
+            app: this.store.server().files.editors.onlyoffice ? ONLY_OFFICE_APP_LOCK : EURO_OFFICE_APP_LOCK,
             isExclusive: false
           })
         }
@@ -81,7 +83,11 @@ export class FilesViewerOnlyOfficeComponent implements OnInit, OnDestroy {
       },
       error: (e: HttpErrorResponse) => {
         this.layout.closeDialog()
-        this.layout.sendNotification('error', 'Unable to open document', e.status === 404 ? 'Unable to load OnlyOffice editor' : e.error.message)
+        this.layout.sendNotification(
+          'error',
+          'Unable to open document',
+          e.status === 404 ? `Unable to load ${this.officeEditorName} editor` : e.error.message
+        )
       }
     })
   }

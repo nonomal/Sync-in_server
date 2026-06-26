@@ -1,11 +1,14 @@
 import { HttpStatus } from '@nestjs/common'
 import { Test, TestingModule } from '@nestjs/testing'
 import bcrypt from 'bcryptjs'
+import { SQL } from 'drizzle-orm'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { Readable } from 'node:stream'
 import { AuthManager } from '../../../authentication/auth.service'
+import { CACHE_AUTH_WEBDAV_PREFIX } from '../../../authentication/constants/cache'
+import { AUTH_SCOPE } from '../../../authentication/constants/scope'
 import { comparePassword } from '../../../common/functions'
 import * as imageModule from '../../../common/image'
 import { pngMimeType, svgMimeType } from '../../../common/image'
@@ -16,7 +19,7 @@ import { fileName, isPathExists } from '../../files/utils/files'
 import { NotificationsManager } from '../../notifications/services/notifications-manager.service'
 import { GROUP_TYPE } from '../constants/group'
 import { MEMBER_TYPE } from '../constants/member'
-import { USER_GROUP_ROLE, USER_MAX_PASSWORD_ATTEMPTS, USER_ROLE } from '../constants/user'
+import { USER_GROUP_ROLE, USER_MAX_PASSWORD_ATTEMPTS, USER_PERMISSION, USER_ROLE } from '../constants/user'
 import { CreateUserDto } from '../dto/create-or-update-user.dto'
 import { DeleteUserDto } from '../dto/delete-user.dto'
 import { UserModel } from '../models/user.model'
@@ -47,6 +50,7 @@ describe(UsersManager.name, () => {
   let adminUsersManager: AdminUsersManager
   let adminUsersQueries: AdminUsersQueries
   let usersQueriesService: UsersQueries
+  let cache: Cache
   let userTest: UserModel
   let deleteUserDto: DeleteUserDto
   let testDataPath: string
@@ -110,6 +114,7 @@ describe(UsersManager.name, () => {
     adminUsersManager = module.get(AdminUsersManager)
     adminUsersQueries = module.get(AdminUsersQueries)
     usersQueriesService = module.get(UsersQueries)
+    cache = module.get(Cache)
     userTest = new UserModel(generateUserTest(), false)
     deleteUserDto = { deleteSpace: true, isGuest: false } satisfies DeleteUserDto
   })
@@ -147,6 +152,56 @@ describe(UsersManager.name, () => {
     const me2 = await usersManager.me(authUser)
     expect(me2.user.impersonated).toBe(true)
     expect(me2.user.clientId).toBe('CID')
+  })
+
+  it('should resolve token users from current database state', async () => {
+    const authUser = new UserModel({
+      ...generateUserTest(),
+      id: 42,
+      role: USER_ROLE.ADMINISTRATOR,
+      applications: Object.values(USER_PERMISSION),
+      clientId: 'client-id',
+      exp: 1234
+    } as any)
+    const currentUser = {
+      ...generateUserTest(),
+      id: 42,
+      role: USER_ROLE.USER,
+      permissions: USER_PERMISSION.SPACES
+    }
+    usersQueriesService.from = vi.fn().mockResolvedValue(currentUser)
+
+    const resolved = await usersManager.fromAuthToken(authUser)
+
+    expect(resolved.role).toBe(USER_ROLE.USER)
+    expect(resolved.applications).toEqual([USER_PERMISSION.SPACES])
+    expect(resolved.clientId).toBe('client-id')
+    expect(resolved.exp).toBe(1234)
+
+    usersQueriesService.from = vi.fn().mockResolvedValue({ ...currentUser, isActive: false })
+    await expect(usersManager.fromAuthToken(authUser)).resolves.toBeNull()
+  })
+
+  it('should validate the source administrator before restoring impersonation', async () => {
+    const authUser = new UserModel({
+      ...generateUserTest(),
+      id: 42,
+      impersonatedFromId: 1,
+      impersonatedClientId: 'admin-client'
+    } as any)
+    const currentUser = { ...generateUserTest(), id: 42 }
+    const admin = { ...generateUserTest(), id: 1, role: USER_ROLE.ADMINISTRATOR }
+    usersQueriesService.from = vi.fn().mockImplementation(async (id: number) => (id === authUser.id ? currentUser : admin))
+
+    const resolved = await usersManager.fromAuthToken(authUser)
+
+    expect(resolved.impersonatedFromId).toBe(admin.id)
+    expect(resolved.impersonatedClientId).toBe('admin-client')
+
+    const formerAdmin = { ...generateUserTest(), id: 1, role: USER_ROLE.USER }
+    usersQueriesService.from = vi.fn().mockImplementation(async (id: number) => (id === authUser.id ? currentUser : formerAdmin))
+
+    await expect(usersManager.fromAuthToken(authUser)).resolves.toBeNull()
   })
 
   it('paths + avatars (default/generate) + create/delete user', async () => {
@@ -224,6 +279,112 @@ describe(UsersManager.name, () => {
     expect(pathsSpy).toHaveBeenCalled()
   })
 
+  it('local password validation burns time when user is missing or rejected by policy', async () => {
+    vi.mocked(comparePassword).mockResolvedValue(false)
+    usersQueriesService.from = vi.fn().mockResolvedValue(null)
+
+    await expect(usersManager.validateLocalPasswordByLogin('missing', 'pwd', '127.0.0.1')).resolves.toBeNull()
+    expect(comparePassword).toHaveBeenCalledWith('pwd', null)
+
+    await expect(usersManager.validateLocalPasswordForUser(null, 'missing', 'pwd', '127.0.0.1')).resolves.toBeNull()
+    expect(comparePassword).toHaveBeenLastCalledWith('pwd', null)
+
+    const localUser = new UserModel({ ...generateUserTest(), isActive: true, passwordAttempts: 0 }, false)
+    usersQueriesService.from = vi.fn().mockResolvedValue(localUser)
+
+    await expect(usersManager.validateLocalPasswordByLogin(localUser.login, 'pwd', '127.0.0.1', undefined, () => false)).resolves.toBeNull()
+    expect(comparePassword).toHaveBeenLastCalledWith('pwd', null)
+  })
+
+  it('scoped local password validation burns app password timing when no app password is checked', async () => {
+    vi.mocked(comparePassword).mockResolvedValue(false)
+    vi.mocked(comparePassword).mockClear()
+    usersQueriesService.from = vi.fn().mockResolvedValue(null)
+
+    await expect(usersManager.validateLocalPasswordByLogin('missing', 'pwd', '127.0.0.1', AUTH_SCOPE.WEBDAV)).resolves.toBeNull()
+    expect(comparePassword).toHaveBeenCalledTimes(2)
+    expect(comparePassword).toHaveBeenNthCalledWith(1, 'pwd', null)
+    expect(comparePassword).toHaveBeenNthCalledWith(2, 'pwd', null)
+
+    vi.mocked(comparePassword).mockClear()
+    const localUser = new UserModel({ ...generateUserTest(), role: USER_ROLE.USER, isActive: true, passwordAttempts: 0 }, false)
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue({ appPasswords: [] })
+
+    await expect(usersManager.validateAppPassword(localUser, 'pwd', '127.0.0.1', AUTH_SCOPE.WEBDAV)).resolves.toBe(false)
+    expect(comparePassword).toHaveBeenCalledTimes(1)
+    expect(comparePassword).toHaveBeenCalledWith('pwd', null)
+
+    vi.mocked(comparePassword).mockClear()
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue({
+      appPasswords: [{ app: AUTH_SCOPE.CLIENT, password: 'APP_HASH' }]
+    })
+
+    await expect(usersManager.validateAppPassword(localUser, 'pwd', '127.0.0.1', AUTH_SCOPE.WEBDAV)).resolves.toBe(false)
+    expect(comparePassword).toHaveBeenCalledTimes(1)
+    expect(comparePassword).toHaveBeenCalledWith('pwd', null)
+
+    vi.mocked(comparePassword).mockClear()
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue({
+      appPasswords: [{ app: AUTH_SCOPE.WEBDAV, password: 'APP_HASH', expiration: new Date(0) }]
+    })
+
+    await expect(usersManager.validateAppPassword(localUser, 'pwd', '127.0.0.1', AUTH_SCOPE.WEBDAV)).resolves.toBe(false)
+    expect(comparePassword).toHaveBeenCalledTimes(1)
+    expect(comparePassword).toHaveBeenCalledWith('pwd', null)
+
+    vi.mocked(comparePassword).mockClear()
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue({
+      appPasswords: [{ app: AUTH_SCOPE.WEBDAV, password: 'APP_HASH' }]
+    })
+
+    await expect(usersManager.validateAppPassword(localUser, 'pwd', '127.0.0.1', AUTH_SCOPE.WEBDAV)).resolves.toBe(false)
+    expect(comparePassword).toHaveBeenCalledTimes(1)
+    expect(comparePassword).toHaveBeenCalledWith('pwd', 'APP_HASH')
+  })
+
+  it('deletes WebDAV auth cache entries for the user when deleting a WebDAV app password', async () => {
+    const secrets = {
+      appPasswords: [
+        { name: 'webdav-client', app: AUTH_SCOPE.WEBDAV, password: 'HASH' },
+        { name: 'desktop-client', app: AUTH_SCOPE.CLIENT, password: 'HASH' }
+      ]
+    }
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue(secrets)
+    usersQueriesService.updateUserOrGuest = vi.fn().mockResolvedValue(true)
+    cache.keys = vi
+      .fn()
+      .mockResolvedValue([`${CACHE_AUTH_WEBDAV_PREFIX}-match`, `${CACHE_AUTH_WEBDAV_PREFIX}-other`, `${CACHE_AUTH_WEBDAV_PREFIX}-failed`])
+    cache.get = vi
+      .fn()
+      .mockResolvedValueOnce({ id: userTest.id })
+      .mockResolvedValueOnce({ id: userTest.id + 1 })
+      .mockResolvedValueOnce(null)
+    cache.mdel = vi.fn().mockResolvedValue(true)
+
+    await expect(usersManager.deleteAppPassword(userTest, 'webdav-client')).resolves.toBeUndefined()
+
+    expect(usersQueriesService.updateUserOrGuest).toHaveBeenCalledWith(userTest.id, {
+      secrets: { appPasswords: [{ name: 'desktop-client', app: AUTH_SCOPE.CLIENT, password: 'HASH' }] }
+    })
+    expect(cache.keys).toHaveBeenCalledWith(`${CACHE_AUTH_WEBDAV_PREFIX}-*`)
+    expect(cache.mdel).toHaveBeenCalledWith([`${CACHE_AUTH_WEBDAV_PREFIX}-match`])
+  })
+
+  it('does not delete WebDAV auth cache entries when deleting another app password scope', async () => {
+    const secrets = {
+      appPasswords: [{ name: 'desktop-client', app: AUTH_SCOPE.CLIENT, password: 'HASH' }]
+    }
+    usersQueriesService.getUserSecrets = vi.fn().mockResolvedValue(secrets)
+    usersQueriesService.updateUserOrGuest = vi.fn().mockResolvedValue(true)
+    cache.keys = vi.fn()
+    cache.mdel = vi.fn()
+
+    await expect(usersManager.deleteAppPassword(userTest, 'desktop-client')).resolves.toBeUndefined()
+
+    expect(cache.keys).not.toHaveBeenCalled()
+    expect(cache.mdel).not.toHaveBeenCalled()
+  })
+
   it('compareUserPassword + updateLanguage + updatePassword branches', async () => {
     usersQueriesService.compareUserPassword = vi.fn().mockResolvedValue(true)
     await expect(usersManager.compareUserPassword(1, 'p')).resolves.toBe(true)
@@ -258,38 +419,53 @@ describe(UsersManager.name, () => {
     usersQueriesService.updateUserOrGuest = vi.fn().mockResolvedValue(true)
     await expect(usersManager.updateNotification(userTest, { notification: 2 })).resolves.toBeUndefined()
 
-    const prevAccess1 = new Date('2021-01-01T00:00:00Z')
-    const u1 = new UserModel(
-      { ...generateUserTest(), isActive: true, passwordAttempts: 3, currentIp: '1.2.3.4', currentAccess: prevAccess1 } as any,
-      false
-    )
-    usersQueriesService.updateUserOrGuest = vi.fn().mockResolvedValue(true)
+    const u1 = new UserModel({ ...generateUserTest(), isActive: true, passwordAttempts: 3 } as any, false)
+    usersQueriesService.updateAccesses = vi.fn().mockResolvedValue(true)
     await expect(usersManager.updateAccesses(u1, '5.6.7.8', true)).resolves.toBeUndefined()
-    const payload1 = vi.mocked(usersQueriesService.updateUserOrGuest).mock.calls[0][1]
-    expect(payload1).toMatchObject({ lastIp: '1.2.3.4', currentIp: '5.6.7.8', passwordAttempts: 0, isActive: true })
-    expect(payload1.lastAccess).toBe(prevAccess1)
-    expect(payload1.currentAccess).toBeInstanceOf(Date)
+    expect(usersQueriesService.updateAccesses).toHaveBeenCalledWith(u1.id, '5.6.7.8', 'reset')
 
-    const prevAccess2 = new Date('2022-02-02T00:00:00Z')
     const u2 = new UserModel(
       {
         ...generateUserTest(),
         isActive: true,
-        passwordAttempts: USER_MAX_PASSWORD_ATTEMPTS - 1,
-        currentIp: 'old.ip',
-        currentAccess: prevAccess2
+        passwordAttempts: USER_MAX_PASSWORD_ATTEMPTS - 1
       } as any,
       false
     )
-    usersQueriesService.updateUserOrGuest = vi.fn().mockResolvedValue(true)
+    usersQueriesService.updateAccesses = vi.fn().mockResolvedValue(true)
     await expect(usersManager.updateAccesses(u2, 'new.ip', false)).resolves.toBeUndefined()
-    const payload2 = vi.mocked(usersQueriesService.updateUserOrGuest).mock.calls[0][1]
-    expect(payload2.passwordAttempts).toBe(USER_MAX_PASSWORD_ATTEMPTS)
-    expect(payload2.isActive).toBe(false)
-    expect(payload2.lastAccess).toBe(prevAccess2)
-    expect(payload2.lastIp).toBe('old.ip')
-    expect(payload2.currentIp).toBe('new.ip')
-    expect(payload2.currentAccess).toBeInstanceOf(Date)
+    expect(usersQueriesService.updateAccesses).toHaveBeenCalledWith(u2.id, 'new.ip', 'increment')
+
+    const u3 = new UserModel({ ...generateUserTest(), secrets: { twoFaSecret: 'secret' } } as any, false)
+    await expect(usersManager.updateAccesses(u3, 'new.ip', true)).resolves.toBeUndefined()
+    expect(usersQueriesService.updateAccesses).toHaveBeenCalledWith(u3.id, 'new.ip', 'preserve')
+    await expect(usersManager.updateAccesses(u3, 'new.ip', false)).resolves.toBeUndefined()
+    expect(usersQueriesService.updateAccesses).toHaveBeenCalledWith(u3.id, 'new.ip', 'increment')
+
+    usersQueriesService.updateAccesses = vi.fn().mockResolvedValue(false)
+    await expect(usersManager.updateAccesses(u1, 'new.ip', false)).rejects.toThrow('Unable to update user accesses')
+  })
+
+  it('should update password attempts atomically', async () => {
+    const where = vi.fn().mockResolvedValue([{ affectedRows: 1 }])
+    const set = vi.fn().mockReturnValue({ where })
+    const update = vi.fn().mockReturnValue({ set })
+    const usersQueries = new UsersQueries({ update } as any, {} as Cache)
+
+    await expect(usersQueries.updateAccesses(userTest.id, '127.0.0.1', 'increment')).resolves.toBe(true)
+    const increment = set.mock.calls[0][0]
+    expect(increment.isActive).toBeInstanceOf(SQL)
+    expect(increment.passwordAttempts).toBeInstanceOf(SQL)
+
+    await expect(usersQueries.updateAccesses(userTest.id, '127.0.0.1', 'reset')).resolves.toBe(true)
+    const reset = set.mock.calls[1][0]
+    expect(reset.passwordAttempts).toBe(0)
+    expect(reset.isActive).toBeUndefined()
+
+    await expect(usersQueries.updateAccesses(userTest.id, '127.0.0.1', 'preserve')).resolves.toBe(true)
+    const preserve = set.mock.calls[2][0]
+    expect(preserve.passwordAttempts).toBeUndefined()
+    expect(preserve.isActive).toBeUndefined()
   })
 
   it('avatars advanced: generateIsNotExists, failure branches, base64 fallback', async () => {
